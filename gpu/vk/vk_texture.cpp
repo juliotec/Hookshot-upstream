@@ -1605,7 +1605,12 @@ bool upload_inner(Texture& tex, const Ranges* dirty) {
                 const uint32_t px_h = std::min(g.h - y0 * (uint32_t)tex.block_h, th * (uint32_t)tex.block_h);
                 const uint64_t out_bytes = tex.astc ? (uint64_t)g.w * px_h * g.d * 4 : (uint64_t)g.tw * th * g.td * out_bpb;
                 const Staging st = staging((out_bytes + 15) & ~15ull, 16);
-                if (!st.buffer) return false;
+                if (!st.buffer) {
+                    // (the sparse binds queued by the rows before are this image's: bound now, not left in sparse_binds
+                    // for the next flush, which binds them into another texture's image)
+                    texture_resident_flush(&tex);
+                    return false;
+                }
                 if (buffer && st.buffer != buffer && !copies.empty()) {   // (a new arena: copy what the last one holds)
                     texture_resident_flush(&tex);
                     checkpoint_mark(upload_cmd(), tex.gpu, 'u');
