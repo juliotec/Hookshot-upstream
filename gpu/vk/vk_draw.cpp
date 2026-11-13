@@ -3642,7 +3642,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 }
                 if (view && tex && d.is_written && (dump_on() || probe_on())) dump_written().push_back({tex, level});
                 if (dump_on()) dump_input(d.is_written ? 'W' : 'R', (uint32_t)dw().imgs.size(), handle, view ? tex : nullptr);
-                if (!view && !dev.null_descriptor) view = dummies.view[(int)vt];
+                if (!view && !dev.null_descriptor) view = VK_NULL_HANDLE;
                 dw().imgs.push_back({VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL});
             }
             w.pImageInfo = &dw().imgs[first];
@@ -4411,13 +4411,11 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
     {   // (hookshot) The characters' own shadow maps (square, depth only, 768 and less; 1e26755d projects them on the screen): their
         // stored depth is moved away from the light, or they shadow themselves whole: Link and the ferns black in the shade, while
         // the ground behind them keeps their shadow. RX_VK_SHADOW_BIAS=<units>,<slope>; 0: as the game asks
-        // (read once, thread-safely: parallel recording threads reach here at once)
-        static float units = 250000.0f, slope = 0.0f;
-        static const bool bias_read = [] {
+        static float units = -1, slope = 0;
+        if (units < 0) {
+            units = 250000.0f, slope = 0.0f;
             if (const char* e = getenv("RX_VK_SHADOW_BIAS")) sscanf(e, "%f,%f", &units, &slope);
-            return true;
-        }();
-        (void)bias_read;
+        }
         if (units > 0 && at.n == 0 && at.width == at.height && at.width <= 768 && at.depth) {
             d.bias[0] += units, d.bias[2] += slope;
             d.bias_en = true;
@@ -4555,73 +4553,8 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
 }
 #undef DYN_CHANGED
 
-/// Without robustness2's nullDescriptor a descriptor's image view must not be VK_NULL_HANDLE
-/// (VUID-VkWriteDescriptorSet-descriptorType-02997): 1x1 black images (1D, 2D/cube, 3D) and a view of each type, made once
-/// in the first recording (rec_cmd). Images that could not all be made are given back: the views stay null, as before
 void make_dummies() {
-    static VkImage img[3]{};
-    static VmaAllocation mem[3]{};
-    if (img[0] || dev.null_descriptor || !rec_cmd) return;
-    const VkImageType type[3] = {VK_IMAGE_TYPE_1D, VK_IMAGE_TYPE_2D, VK_IMAGE_TYPE_3D};
-    const uint32_t layers[3] = {1, 6, 1};
-    for (int i = 0; i < 3; i++) {
-        VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        ci.flags = i == 1 ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
-        ci.imageType = type[i];
-        ci.format = VK_FORMAT_R8G8B8A8_UNORM;
-        ci.extent = {1, 1, 1};
-        ci.mipLevels = 1, ci.arrayLayers = layers[i];
-        ci.samples = VK_SAMPLE_COUNT_1_BIT;
-        ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        if (!create_image(ci, img[i], mem[i])) {
-            for (int j = 0; j <= i; j++) {
-                if (img[j]) destroy_image(img[j], mem[j]);
-                img[j] = VK_NULL_HANDLE, mem[j] = nullptr;
-            }
-            static int logged;
-            if (logged++ < 4) logf("vk: the dummy images (no nullDescriptor): not made");
-            return;
-        }
-    }
-    VkImageMemoryBarrier2 b[3]{};
-    for (int i = 0; i < 3; i++) {
-        b[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-        b[i].srcStageMask = VK_PIPELINE_STAGE_2_NONE, b[i].dstStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
-        b[i].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        b[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, b[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        b[i].srcQueueFamilyIndex = b[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b[i].image = img[i];
-        b[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers[i]};
-    }
-    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    d.imageMemoryBarrierCount = 3, d.pImageMemoryBarriers = b;
-    vkCmdPipelineBarrier2(rec_cmd, &d);
-    const VkClearColorValue black{};
-    for (int i = 0; i < 3; i++) {
-        const VkImageSubresourceRange r{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers[i]};
-        vkCmdClearColorImage(rec_cmd, img[i], VK_IMAGE_LAYOUT_GENERAL, &black, 1, &r);
-    }
-    for (int i = 0; i < 3; i++) {
-        b[i].srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT, b[i].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        b[i].dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-        b[i].dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
-        b[i].oldLayout = b[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    }
-    vkCmdPipelineBarrier2(rec_cmd, &d);
-    // (VkImageViewType order: 1D, 2D, 3D, CUBE, 1D_ARRAY, 2D_ARRAY, CUBE_ARRAY)
-    const int src[7] = {0, 1, 2, 1, 0, 1, 1};
-    const uint32_t view_layers[7] = {1, 1, 1, 6, 1, 6, 6};
-    for (int v = 0; v < 7; v++) {
-        if (v == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY && !dev.features.imageCubeArray) continue;
-        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        vi.image = img[src[v]];
-        vi.viewType = (VkImageViewType)v;
-        vi.format = VK_FORMAT_R8G8B8A8_UNORM;
-        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, view_layers[v]};
-        if (vkCreateImageView(dev.device, &vi, nullptr, &dummies.view[v]) != VK_SUCCESS) dummies.view[v] = VK_NULL_HANDLE;
-    }
+    if (dummies.view[0] || dev.null_descriptor) return;
 }
 
 
@@ -7384,8 +7317,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     }
     if (g_fine) fine_ns[FT_VERTEX] += prof_now() - fine_vertex_t0;
     const VkIndexType itype = d.itype == 0 ? VK_INDEX_TYPE_UINT8_EXT : d.itype == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
-    // (quads read their indices on the CPU and draw with 32-bit ones: they need no uint8 index support)
-    if (d.indexed && d.itype == 0 && !dev.index_uint8 && d.prim != NVN_DRAW_PRIMITIVE_QUADS) SKIP_HERE();
+    if (d.indexed && d.itype == 0 && !dev.index_uint8) SKIP_HERE();
     if (d.prim == NVN_DRAW_PRIMITIVE_QUADS) {   // (quads as two triangles each: indices made in the stream)
         if (d.indirect || d.count < 4) SKIP_HERE();
         if (d.count > (1 << 24)) SKIP_HERE();   // (hookshot: 4M quads at most; the game's count sized host vectors of up to 16 GB)
@@ -8720,7 +8652,7 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
                 else if (cached_compute(&ci, &made) == VK_SUCCESS && made) pre->computes_compiled++;
                 else made = VK_NULL_HANDLE, pre->computes_failed++;
                 std::lock_guard lk(pre->mu);
-                if (!pre->abandoned) std::atomic_ref<VkPipeline>(p.compute_pipeline).store(made, std::memory_order_release);
+                if (!pre->abandoned) p.compute_pipeline = made;
                 else if (made) vkDestroyPipeline(dev.device, made, nullptr);   // (the game went on: it builds its own)
             } else if (i < computes.size() + fallbacks.size()) {
                 // (a program a draw is already building is left to it: compute_state, as in fallback_pipelines_ready)
@@ -9230,10 +9162,8 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     // 2026-11-08). The dispatch waits up to 50 ms for it, which covers NVIDIA's compiles; one still compiling after that is left
     // out until it is ready, as graphics draws are. RX_VK_COMPUTE_WAIT=1: waited for, as before)
     static const bool compute_wait = env_on("RX_VK_COMPUTE_WAIT");
-    // (compute_pipeline is written by the build worker and the precompile's threads while dispatches read it: always atomically)
-    const auto cpipe = [&p] { return std::atomic_ref<VkPipeline>(p.compute_pipeline).load(std::memory_order_acquire); };
-    if (use.on) use.pipeline(cpipe() != VK_NULL_HANDLE, false);
-    if (!compute_wait && !cpipe() && !taau_key(p.key) && p.compute_state.load(std::memory_order_acquire) != 2) {
+    if (use.on) use.pipeline(p.compute_pipeline != VK_NULL_HANDLE, false);
+    if (!compute_wait && !p.compute_pipeline && !taau_key(p.key) && p.compute_state.load(std::memory_order_acquire) != 2) {
         int none = 0;
         // (a program read from the cache without its code, vk_progcache.cpp: its module made now, by the dispatch that starts its
         // pipeline. One whose code does not read is failed, and left out below)
@@ -9258,7 +9188,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
                     if (told++ < 20) logf("vk: compute pipeline of %016llx not made (%d)", (unsigned long long)q.key, (int)r);
                     q.failed = true;
                 } else {
-                    std::atomic_ref<VkPipeline>(q.compute_pipeline).store(made, std::memory_order_release);
+                    q.compute_pipeline = made;
                 }
                 const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
                 if (ms >= 200) logf("vk: compute pipeline of %016llx: SLOW compile, %lld ms (on a worker)", (unsigned long long)q.key, (long long)ms);
@@ -9269,13 +9199,13 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
             };
             if (use.on) use.pipeline(false, true), use.pipeline_made(cached ? 2 : 3);   // (from a cache, or compiled on a worker)
             if (cached) {
-                std::atomic_ref<VkPipeline>(p.compute_pipeline).store(cached, std::memory_order_release);
+                p.compute_pipeline = cached;
                 st_pipelines++;
                 p.compute_state.store(2, std::memory_order_release);
             } else {
                 auto failed = [job]() noexcept {
                     Program& q = const_cast<Program&>(*job);
-                    std::atomic_ref<VkPipeline>(q.compute_pipeline).store(VK_NULL_HANDLE, std::memory_order_release);
+                    q.compute_pipeline = VK_NULL_HANDLE;
                     q.failed = true;
                     q.compute_state.store(2, std::memory_order_release);
                 };
@@ -9296,10 +9226,10 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
             use.skipped();
             return;
         }
-        if (p.failed || !cpipe()) SKIP_HERE();
+        if (p.failed || !p.compute_pipeline) SKIP_HERE();
     }
-    ParLock plk(!cpipe());
-    if (!cpipe() && !taau_key(p.key)) {
+    ParLock plk(!p.compute_pipeline);
+    if (!p.compute_pipeline && !taau_key(p.key)) {   // (a stood-in network is never compiled)
         if (!program_cache_complete(p)) SKIP_HERE();   // (read without its code: see above)
         pcache_init();
         VkComputePipelineCreateInfo ci = compute_pipeline_info(p, true);   // (RX_VK_NOOPT=1, as for graphics pipelines above)
@@ -9308,14 +9238,13 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
             static std::atomic<int> told{0};
             if (told++ < 400) logf("vk: compute pipeline of %016llx: compiling", (unsigned long long)p.key);
         }
-        VkPipeline built = VK_NULL_HANDLE;   // (published only once made: other threads read it meanwhile)
-        if (const VkResult made = cached_compute(&ci, &built); made != VK_SUCCESS) {
+        if (const VkResult made = cached_compute(&ci, &p.compute_pipeline); made != VK_SUCCESS) {
             static std::atomic<int> told{0};
             if (told++ < 20) logf("vk: compute pipeline of %016llx not made (%d)", (unsigned long long)p.key, (int)made);
+            p.compute_pipeline = VK_NULL_HANDLE;
             p.failed = true;
             SKIP_HERE();
         }
-        std::atomic_ref<VkPipeline>(p.compute_pipeline).store(built, std::memory_order_release);
         {
             const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
             if (ms >= 200) logf("vk: compute pipeline of %016llx: SLOW compile, %lld ms", (unsigned long long)p.key, (long long)ms);
@@ -9380,12 +9309,11 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     if (fsr3_stand_in(cmd, s, p)) return void(st_dispatches++);
     if (temporal_stand_in(cmd, s, p)) return void(st_dispatches++);
     if (taau_stand_in(cmd, s, p)) return void(st_dispatches++);
-    const VkPipeline pipe = cpipe();
-    if (!pipe) SKIP_HERE();
+    if (!p.compute_pipeline) SKIP_HERE();
     dump_ssbos(cmd, p, "before");
     if (!p.dispatched.load(std::memory_order_relaxed)) compute_variant_note(p.key, p.variant);   // (which variant: this install's own)
     if (!p.dispatched.exchange(true, std::memory_order_relaxed)) compute_note(p.key), state_record_compute(p.key);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.compute_pipeline);
     if (!bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p)) SKIP_HERE();
     push_constants(cmd, p, nullptr);
     gprof_begin(cmd);
