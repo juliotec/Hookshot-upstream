@@ -2154,6 +2154,10 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
     const bool in_textures = compact_on() && !x.sparse && !(as_target && !is_bc(x.format) && !is_astc(x.format));
     if (x.sparse) {
         ci.flags |= VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT;
+        // (a compressed one with the usage its sparse residency was asked with, above: no raw storage or attachment views,
+        // which the driver did not say it can make sparse; as a compressed image refused without them, below)
+        if (is_bc(x.format))
+            ci.usage &= ~(VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT), x.usage = ci.usage;
         bool ok = vkCreateImage(dev.device, &ci, nullptr, &x.image) == VK_SUCCESS;
         if (ok) {
             VkMemoryRequirements mr{};
